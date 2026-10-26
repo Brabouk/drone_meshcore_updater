@@ -14,6 +14,7 @@
  */
 
 #include "ble_scanner.h"
+#include "adv_control.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -106,6 +107,22 @@ static const struct bt_le_scan_param s_scan_params = {
 	.interval = 160,
 	.window   = 80,
 };
+
+/*
+ * Only used when the advertiser had to be taken down for the scan — a
+ * controller that refuses a scan while a legacy connectable advertiser is up
+ * (see adv_control.h). The find then runs in windows instead of one long scan,
+ * and the advertiser goes back up between them: a device searching for an
+ * unattended target must still be reachable by a browser, which is the whole
+ * reason auto_flash exists.
+ *
+ * 8 s of scanning is generous against peers that advertise every 20-100 ms, and
+ * 2 s of advertising is enough for a central to see the device and start a
+ * connection. Both are "one window", not a policy: the caller's timeout still
+ * decides when the find ends.
+ */
+#define BORROW_WINDOW_MS 8000
+#define BORROW_ADV_MS    2000
 
 void ble_scanner_set_debug(bool on) { s_debug = on; }
 
@@ -316,6 +333,39 @@ static int scan_and_wait(uint32_t timeout_ms)
 	memset(&s_ctx.match, 0, sizeof(s_ctx.match));
 
 	int rc = bt_le_scan_start(&s_scan_params, scan_rx_cb);
+	bool borrowed = false;
+
+	if (rc == -EINVAL) {
+		/* Single-radio controller: a legacy connectable advertiser and a
+		 * scan cannot both be enabled, and this board answers -EINVAL for
+		 * every scan parameter set — so no amount of parameter tuning
+		 * gets here, only stopping the advertiser does.
+		 *
+		 * The advertiser is the half that yields: a find has a target and
+		 * a caller waiting on it, while an unsolicited restart can wait a
+		 * window. It goes back up between windows below, because a device
+		 * searching for an unattended target must still be reachable by a
+		 * browser — that is the whole reason auto_flash exists. */
+		int prc = adv_pause();
+
+		if (prc == 0) {
+			rc = bt_le_scan_start(&s_scan_params, scan_rx_cb);
+			borrowed = (rc == 0);
+			if (!borrowed) {
+				/* Some other reason: give the advertiser
+				 * straight back and report that one. */
+				adv_resume();
+			} else {
+				LOG_INF("scan: advertiser paused for the find "
+					"(this controller cannot do both), "
+					"%d ms windows / %d ms advertising",
+					BORROW_WINDOW_MS, BORROW_ADV_MS);
+			}
+		} else {
+			LOG_WRN("scan: advertising could not be paused rc=%d",
+				prc);
+		}
+	}
 	if (rc) {
 		/* Hand the radio back. Without this the failure is permanent
 		 * and silent in a way the log does not show: s_radio stays
@@ -328,8 +378,86 @@ static int scan_and_wait(uint32_t timeout_ms)
 	}
 	k_mutex_unlock(&s_radio_lock);
 
-	rc = k_sem_take(&s_ctx.found_sem,
-			timeout_ms == 0 ? K_FOREVER : K_MSEC(timeout_ms));
+	if (borrowed) {
+		/* Windowed find: scan, hand the radio back to the advertiser,
+		 * take it again. s_radio stays RADIO_FIND across the gap so a
+		 * survey cannot slip in and steal the scan the find is about to
+		 * restart. */
+		uint32_t spent = 0;
+
+		for (;;) {
+			uint32_t win = BORROW_WINDOW_MS;
+
+			if (timeout_ms != 0) {
+				uint32_t left = (spent >= timeout_ms) ?
+						0 : (timeout_ms - spent);
+
+				win = (left && left < win) ? left : win;
+			}
+
+			rc = k_sem_take(&s_ctx.found_sem, K_MSEC(win));
+			if (rc == 0 || atomic_get(&s_cancel)) {
+				break;
+			}
+			spent += win;
+
+			if (timeout_ms != 0 && spent >= timeout_ms) {
+				/* Keep the shared -EAGAIN → -ETIMEDOUT
+				 * mapping below. */
+				rc = -EAGAIN;
+				break;
+			}
+
+			k_mutex_lock(&s_radio_lock, K_FOREVER);
+			int src = bt_le_scan_stop();
+
+			if (src && src != -EALREADY) {
+				LOG_WRN("scan: bt_le_scan_stop rc=%d", src);
+			}
+			k_mutex_unlock(&s_radio_lock);
+
+			adv_resume();
+			k_sleep(K_MSEC(BORROW_ADV_MS));
+
+			/* A client connected during that gap: its link has the
+			 * radio now and a scan next to it would cost it
+			 * airtime for nothing. Wait the session out — the find
+			 * resumes when the browser disconnects, and the
+			 * caller's timeout keeps running meanwhile. */
+			while (adv_session_busy() && !atomic_get(&s_cancel) &&
+			       (timeout_ms == 0 || spent < timeout_ms)) {
+				k_sleep(K_MSEC(500));
+				if (timeout_ms != 0) {
+					spent += 500;
+				}
+			}
+			if (atomic_get(&s_cancel)) {
+				break;
+			}
+			if (timeout_ms != 0 && spent >= timeout_ms) {
+				rc = -EAGAIN;
+				break;
+			}
+
+			int rrc = adv_pause();
+
+			if (rrc == 0) {
+				k_mutex_lock(&s_radio_lock, K_FOREVER);
+				rrc = bt_le_scan_start(&s_scan_params,
+						       scan_rx_cb);
+				k_mutex_unlock(&s_radio_lock);
+			}
+			if (rrc) {
+				LOG_ERR("scan: restart rc=%d", rrc);
+				adv_resume();
+				rc = rrc;
+				break;
+			}
+		}
+	} else {
+		rc = k_sem_take(&s_ctx.found_sem,
+				timeout_ms == 0 ? K_FOREVER : K_MSEC(timeout_ms));
+	}
 
 	k_mutex_lock(&s_radio_lock, K_FOREVER);
 	int stop_rc = bt_le_scan_stop();
@@ -338,6 +466,13 @@ static int scan_and_wait(uint32_t timeout_ms)
 	}
 	atomic_cas(&s_radio, RADIO_FIND, RADIO_IDLE);
 	k_mutex_unlock(&s_radio_lock);
+
+	/* Before anything can return: the advertiser was taken down for this
+	 * find and must not stay down. Idempotent, so the paths that already
+	 * resumed inside the loop cost nothing here. */
+	if (borrowed) {
+		adv_resume();
+	}
 
 	/* Checked before rc, because a cancel wakes the semaphore exactly as a
 	 * match does — rc is 0 either way and s_ctx.match is stale. */

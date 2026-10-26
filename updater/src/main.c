@@ -37,6 +37,7 @@
 #include "dfu_runner.h"
 #include "ble_scanner.h"
 #include "ble_pairing.h"
+#include "adv_control.h"
 
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
@@ -110,8 +111,23 @@ static const struct bt_le_conn_param s_fast_param =
  */
 #define ADV_RETRY_MS 1000
 
+/* Set while the scanner has borrowed the radio (adv_pause()), so a retry that
+ * fires mid-find neither advertises under it nor fights it for the controller's
+ * single enable. Guarded rather than counted on purpose: there is one
+ * advertiser, and the scanner's find path is serialised by its own radio lock. */
+static bool s_adv_paused;
+
 static int adv_start_raw(void)
 {
+	/* Refuse while the scanner holds the radio. A start attempted anyway
+	 * either fails with -EINVAL (the conflict this whole dance exists for)
+	 * or wins the race and leaves the scan that is mid-find dead — and the
+	 * caller cannot tell those apart from the rc. adv_resume() reschedules
+	 * this work when the scanner is done. */
+	if (s_adv_paused) {
+		return -EAGAIN;
+	}
+
 	int rc = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
 				 sd, ARRAY_SIZE(sd));
 	return rc == -EALREADY ? 0 : rc;
@@ -123,9 +139,59 @@ static K_WORK_DELAYABLE_DEFINE(s_adv_restart, adv_restart_fn);
  * than one of each per second for the length of a DFU. */
 static bool s_adv_failing;
 
+int adv_pause(void)
+{
+	if (s_adv_paused) {
+		return 0;
+	}
+
+	/* A pending retry would otherwise fire between the stop and the scan
+	 * start and put the advertiser straight back up. */
+	k_work_cancel_delayable(&s_adv_restart);
+
+	int rc = bt_le_adv_stop();
+	if (rc && rc != -EALREADY) {
+		LOG_WRN("adv pause: bt_le_adv_stop rc=%d", rc);
+		k_work_reschedule(&s_adv_restart, K_NO_WAIT);
+		return rc;
+	}
+
+	s_adv_paused = true;
+	return 0;
+}
+
+void adv_resume(void)
+{
+	if (!s_adv_paused) {
+		return;
+	}
+
+	s_adv_paused = false;
+	/* Through the work item, not directly: a start here runs in the
+	 * scanner's thread with the radio lock held, and the retry loop is what
+	 * already handles a start that fails transiently. */
+	k_work_reschedule(&s_adv_restart, K_NO_WAIT);
+}
+
+/* Peripheral links in progress. Only the browser's SMP session counts — the
+ * DFU target link is a central link and scanning next to it is the whole point
+ * of the find. */
+static atomic_t s_periph_conns = ATOMIC_INIT(0);
+
+bool adv_session_busy(void)
+{
+	return atomic_get(&s_periph_conns) > 0;
+}
+
 static void adv_restart_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
+
+	/* The scanner owns the radio right now; adv_resume() will bring this
+	 * back. Nothing to log — this is the expected state during a find. */
+	if (s_adv_paused) {
+		return;
+	}
 
 	/* Try it plainly first. The pause costs a running scan a blind
 	 * interval, and on a controller that does not need it (extended
@@ -182,6 +248,9 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 	    info.role != BT_CONN_ROLE_PERIPHERAL) {
 		return;
 	}
+	/* Before anything that can fail below: the count has to match the
+	 * disconnect callback, which fires regardless. */
+	atomic_inc(&s_periph_conns);
 	/* Peripheral only, which is why it is below the role check: a central
 	 * link is our DFU target and says nothing about whether we are
 	 * discoverable. A connectable advertiser stops of its own accord when
@@ -205,9 +274,15 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 	 * errors while our peripheral advertising is still running.
 	 */
 	struct bt_conn_info info;
-	if (bt_conn_get_info(conn, &info) == 0 &&
-	    info.role != BT_CONN_ROLE_PERIPHERAL) {
+	int irc = bt_conn_get_info(conn, &info);
+
+	if (irc == 0 && info.role != BT_CONN_ROLE_PERIPHERAL) {
 		return;
+	}
+	/* Only the peripheral count, and only what on_connected() added: a failed
+	 * info query leaves the count alone rather than guessing it down. */
+	if (irc == 0 && atomic_get(&s_periph_conns) > 0) {
+		atomic_dec(&s_periph_conns);
 	}
 	LOG_INF("peer disconnected reason=0x%02x", reason);
 	/* Handed to the system workqueue rather than done here. This callback
