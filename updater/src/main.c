@@ -117,19 +117,6 @@ static const struct bt_le_conn_param s_fast_param =
  * advertiser, and the scanner's find path is serialised by its own radio lock. */
 static bool s_adv_paused;
 
-#if defined(CONFIG_BT_EXT_ADV)
-/* One extended advertising set, created on first use.
- *
- * With CONFIG_BT_EXT_ADV Zephyr already routes a legacy bt_le_adv_start()
- * through the extended API — as a *legacy PDU* set, and on this controller that
- * arrangement turned out to be unconnectable (a central lists the device, then
- * the link never forms). Creating the set here is what asks for a connectable
- * extended set explicitly, which is the arrangement the vendor sample and the
- * controller's own feature list describe.
- */
-static struct bt_le_ext_adv *s_adv_set;
-#endif
-
 static int adv_start_raw(void)
 {
 	/* Refuse while the scanner holds the radio. A start attempted anyway
@@ -141,31 +128,9 @@ static int adv_start_raw(void)
 		return -EAGAIN;
 	}
 
-#if defined(CONFIG_BT_EXT_ADV)
-	if (s_adv_set == NULL) {
-		int rc = bt_le_ext_adv_create(BT_LE_EXT_ADV_CONN, NULL,
-					      &s_adv_set);
-
-		if (rc) {
-			return rc;
-		}
-
-		rc = bt_le_ext_adv_set_data(s_adv_set, ad, ARRAY_SIZE(ad),
-					    sd, ARRAY_SIZE(sd));
-		if (rc) {
-			LOG_ERR("adv set data rc=%d", rc);
-			return rc;
-		}
-	}
-
-	int rc = bt_le_ext_adv_start(s_adv_set, BT_LE_EXT_ADV_START_DEFAULT);
-
-	return rc == -EALREADY ? 0 : rc;
-#else
 	int rc = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
 				 sd, ARRAY_SIZE(sd));
 	return rc == -EALREADY ? 0 : rc;
-#endif
 }
 
 static void adv_restart_fn(struct k_work *work);
@@ -184,12 +149,7 @@ int adv_pause(void)
 	 * start and put the advertiser straight back up. */
 	k_work_cancel_delayable(&s_adv_restart);
 
-#if defined(CONFIG_BT_EXT_ADV)
-	int rc = (s_adv_set != NULL) ? bt_le_ext_adv_stop(s_adv_set)
-				    : -EALREADY;
-#else
 	int rc = bt_le_adv_stop();
-#endif
 	if (rc && rc != -EALREADY) {
 		LOG_WRN("adv pause: bt_le_adv_stop rc=%d", rc);
 		k_work_reschedule(&s_adv_restart, K_NO_WAIT);
